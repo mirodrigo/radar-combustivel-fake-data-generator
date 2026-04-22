@@ -1,81 +1,230 @@
-# Radar Combustível — MongoDB (seed)
+# Plataforma Radar Combustível
 
-Material de apoio ao trabalho final: base documental no **MongoDB** para o caso **Radar Combustível**, com script de carga usando **Faker** e **Docker Compose** para subir o servidor localmente.
+> Trabalho final — **MBA FIAP em Engenharia de Dados**
+> Pipeline streaming **MongoDB → Redis** com visualização em **Streamlit**.
+
+A Plataforma Radar Combustível é um estudo de caso de pipeline de dados em
+tempo (quase) real: o MongoDB é a fonte de eventos (cadastro de postos,
+atualizações de preço, buscas de usuários, localização) e o Redis atua
+como camada de *serving* de baixa latência — alimentando rankings, mapa
+geográfico e séries temporais consumidas por uma interface Streamlit.
+
+## Integrantes
+
+| RM       | Nome                               |
+|----------|------------------------------------|
+| 361560   | Enio Roberto Lourenço              |
+| 360485   | Luis Henrique Kalil Duarte         |
+| 363586   | Leila Moreira Gomes Roque          |
+| 365533   | Adonias Ferreira Barros            |
+
+---
+
+## Arquitetura
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        FONTES DE EVENTOS                           │
+│  seed_radar_combustivel.py  ──┐                                    │
+│  scripts/gerar_eventos.py  ───┼──►  MongoDB (replica set rs0)      │
+│  Integrações reais (futuro) ──┘     • postos                       │
+│                                     • eventos_preco                │
+│                                     • buscas_usuarios              │
+│                                     • avaliacoes_interacoes        │
+│                                     • localizacoes_postos          │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │  Change Stream (oplog, rs0)
+                               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                 PIPELINE (pipeline/mongodb_consumer.py)            │
+│  • Backfill inicial via bootstrap.py                               │
+│  • Watchers de eventos_preco e buscas_usuarios                     │
+│  • Normalização + enriquecimento com cadastro do posto             │
+│  • Logs em PT-BR + contadores em pipeline:metricas                 │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                   REDIS STACK (serving layer)                      │
+│  Hash   posto:{id}                         • cadastro resumido     │
+│  GEO    geo:postos                         • proximidade           │
+│  ZSET   ranking:menor_preco:{comb}[:{uf}]  • preço (asc)           │
+│  ZSET   ranking:buscas:postos|regioes      • demanda               │
+│  TS     ts:preco:{posto}:{combustivel}     • evolução histórica    │
+│  TS     ts:preco_medio:{combustivel}       • referência global     │
+│  STREAM stream:eventos_preco               • auditoria/debug       │
+│  FT     idx:postos (RediSearch)            • busca textual         │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                  INTERFACE (app/streamlit_app.py)                  │
+│  • KPIs globais, ranking por preço, mapa pydeck (GEOSEARCH)        │
+│  • Séries temporais comparando posto x média do combustível        │
+│  • Busca textual RediSearch + histórico de eventos no stream       │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Detalhes, decisões técnicas e diagramas estão em
+[`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
+
+---
 
 ## Pré-requisitos
 
-- [Docker](https://docs.docker.com/get-docker/) e Docker Compose
-- Python 3.10 ou superior
-- `pip` para instalar dependências
+- Docker 24+ e Docker Compose v2
+- (Opcional, para rodar scripts fora do container) Python 3.11+
 
-## Início rápido
+Portas utilizadas:
 
-Na pasta deste repositório (`Trabalho_final`):
+| Porta  | Serviço                   |
+|--------|---------------------------|
+| 27017  | MongoDB                   |
+| 6379   | Redis Stack               |
+| 5540   | RedisInsight              |
+| 8501   | Streamlit                 |
 
-1. **Subir o MongoDB**
+---
 
-   ```bash
-   docker compose up -d
-   ```
+## Como executar (Docker — recomendado)
 
-2. **Instalar dependências Python**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Popular o banco** (100 mil documentos por coleção; ajustável por variável de ambiente)
+1. **Clonar o repositório** e entrar na pasta:
 
    ```bash
-   python seed_radar_combustivel.py
+   git clone https://github.com/mirodrigo/radar-combustivel-fake-data-generator.git
+   cd radar-combustivel-fake-data-generator
    ```
 
-O script remove e recria as coleções a cada execução, para manter o seed reproduzível.
+2. **Subir a infraestrutura** (MongoDB + Redis + RedisInsight):
 
-## Banco e coleções
+   ```bash
+   docker compose up -d mongo mongo-init redis redis-insight
+   ```
 
-| Banco (padrão)     | Descrição                          |
-|--------------------|------------------------------------|
-| `radar_combustivel` | Base usada pelo seed               |
+3. **Popular o MongoDB** (carga inicial — 2.000 registros por coleção
+   já é suficiente para validar o pipeline):
 
-| Coleção                 | Conteúdo principal                                      |
-|-------------------------|---------------------------------------------------------|
-| `postos`                | Cadastro de postos, endereço e `location` (GeoJSON)     |
-| `eventos_preco`         | Atualizações de preço por posto e tipo de combustível   |
-| `buscas_usuarios`       | Buscas, filtros e métricas de consulta                  |
-| `avaliacoes_interacoes` | Avaliações, favoritos e outras interações                 |
-| `localizacoes_postos`   | Localização indexável (geo + município/IBGE), 1:1 com posto |
+   ```bash
+   docker compose run --rm \
+     -e N=2000 \
+     pipeline python seed_radar_combustivel.py
+   ```
 
-Após a carga, o script cria **índices** (incluindo geoespacial em `postos.location` e `localizacoes_postos.geo`).
+   Para uma carga maior (demo pesada): `-e N=20000`.
 
-## Variáveis de ambiente (opcional)
+4. **Subir o pipeline, o gerador contínuo e o Streamlit**:
 
-| Variável    | Padrão                         | Significado                          |
-|-------------|--------------------------------|--------------------------------------|
-| `MONGO_URI` | `mongodb://localhost:27017`    | URI de conexão do MongoDB            |
-| `DB_NAME`   | `radar_combustivel`            | Nome do database                     |
-| `SEED`      | `42`                           | Semente para dados reproduzíveis     |
-| `BATCH_SIZE`| `5000`                         | Tamanho do lote em `insert_many`     |
-| `N`         | `100000`                       | Quantidade de documentos **por coleção** |
+   ```bash
+   docker compose up -d pipeline gerador streamlit
+   ```
 
-Exemplo com volume menor para testes:
+5. **Acessar a interface**: <http://localhost:8501>
+   RedisInsight (opcional): <http://localhost:5540>
+
+6. **Acompanhar os logs em tempo real**:
+
+   ```bash
+   docker compose logs -f pipeline gerador
+   ```
+
+### Encerrando
 
 ```bash
-set N=1000
-python seed_radar_combustivel.py
+docker compose down           # para containers (mantém dados)
+docker compose down -v        # remove também os volumes
 ```
 
-No Linux ou macOS, use `export N=1000`.
+---
 
-## Docker — comandos úteis
+## Como executar sem Docker
 
-- Parar os containers: `docker compose down`
-- Parar e remover o volume persistente dos dados: `docker compose down -v`
+Requer Python 3.11+, MongoDB 7 com replica set (`rs0`) e Redis Stack
+locais já em execução. Em seguida:
 
-## Observação
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 
-A carga com `N=100000` em **cinco** coleções gera centenas de milhares de documentos e pode levar vários minutos e espaço em disco relevante, conforme a máquina. Reduza `N` durante o desenvolvimento.
+python seed_radar_combustivel.py         # carga inicial no Mongo
+python -m scripts.bootstrap              # hidratação inicial do Redis
+python -m pipeline.mongodb_consumer      # consumer do change stream
+python -m scripts.gerar_eventos          # (terminal 2) gerador contínuo
+streamlit run app/streamlit_app.py       # (terminal 3) UI
+```
 
-## Referência do trabalho
+---
 
-O enunciado completo está em `../trabalho_final/Trabalho-final-IMDB.md` (raiz do repositório de apostilas).
+## Estrutura do repositório
+
+```
+.
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── seed_radar_combustivel.py          # carga inicial (MongoDB)
+├── app/
+│   └── streamlit_app.py               # UI
+├── pipeline/
+│   ├── chaves_redis.py                # convenção de chaves Redis
+│   ├── event_transformer.py           # normalização de eventos
+│   ├── logger.py                      # logger padronizado
+│   ├── mongodb_consumer.py            # change stream -> redis
+│   ├── redis_writer.py                # camada de gravação no Redis
+│   └── settings.py
+├── scripts/
+│   ├── bootstrap.py                   # hidratação inicial do Redis
+│   └── gerar_eventos.py               # gerador contínuo de eventos
+└── docs/
+    ├── ARQUITETURA.md                 # relatório técnico + integrantes
+    └── imagens/                       # prints para o relatório
+```
+
+---
+
+## Funcionalidades da interface (Streamlit)
+
+- **KPIs globais** — número de postos cadastrados, combustíveis ativos,
+  menor preço do filtro atual, eventos recentes no stream.
+- **Ranking de menor preço** por combustível, com filtro opcional por UF.
+- **Mapa** com `GEOSEARCH` em raio ajustável (pydeck). Ao passar o mouse
+  o tooltip exibe nome, bandeira, cidade/UF e preço.
+- **Séries temporais** comparando o posto selecionado contra o preço
+  médio do combustível (`TS.RANGE`).
+- **Busca textual** via RediSearch (`idx:postos`) com filtro por
+  bandeira, cidade, UF e nome fantasia.
+- **Auditoria** — últimos eventos consumidos (stream
+  `stream:eventos_preco`).
+
+---
+
+## Observabilidade
+
+- Logs estruturados em **Português do Brasil** (pipeline, bootstrap,
+  gerador e consumer).
+- Contadores em `pipeline:metricas` (Hash) atualizados pelo consumer:
+  `eventos_preco_processados`, `buscas_processadas`,
+  `erros_processamento`.
+- Stream `stream:eventos_preco` mantém as últimas 5.000 ocorrências
+  para depuração (consumido na interface Streamlit).
+
+---
+
+## Tratamento de falhas
+
+- **Retries exponenciais** (`tenacity`) na conexão com o MongoDB no
+  bootstrap e no gerador de eventos.
+- **Reconexão automática** do change stream em caso de
+  `OperationFailure`/`PyMongoError`/`RedisConnectionError` — o loop
+  externo aguarda 2–3 segundos e reabre o `watch`.
+- **`TS.CREATE` sob demanda** para séries temporais novas, com
+  `DUPLICATE_POLICY=LAST` e retenção de 7 dias.
+- **Encerramento gracioso** via `SIGTERM`/`SIGINT` no consumer.
+
+---
+
+## Referências
+
+- [`mirodrigo/lab-streaming-mongo-redis`](https://github.com/mirodrigo/lab-streaming-mongo-redis)
+  — padrão de arquitetura/programação.
+- [MongoDB Change Streams](https://www.mongodb.com/docs/manual/changeStreams/)
+- [Redis Stack — Sorted Sets, TimeSeries, Geo, RediSearch](https://redis.io/docs/data-types/)
