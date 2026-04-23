@@ -1,14 +1,146 @@
 services:
   mongo:
     image: mongo:7.0
-    container_name: radar-combustivel-mongo
+    container_name: radar-mongo
     restart: unless-stopped
+    command:
+      [
+        "mongod",
+        "--replSet",
+        "rs0",
+        "--bind_ip_all",
+        "--port",
+        "27017",
+      ]
     ports:
       - "27017:27017"
     environment:
       MONGO_INITDB_DATABASE: radar_combustivel
     volumes:
       - mongo_radar_data:/data/db
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval \"db.adminCommand('ping').ok\" || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mongo-init:
+    image: mongo:7.0
+    container_name: radar-mongo-init
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint:
+      [
+        "bash",
+        "-c",
+        "mongosh --host mongo:27017 --quiet --eval \"try { var s = rs.status(); print('replica set já inicializado: ' + s.set); } catch(e) { rs.initiate({_id:'rs0', members:[{_id:0, host:'mongo:27017'}]}); print('replica set inicializado'); }\"",
+      ]
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: radar-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_radar_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: radar-redis-insight
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: radar-combustivel-app:latest
+    container_name: radar-pipeline
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?directConnection=true
+      DB_NAME: radar_combustivel
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    command:
+      [
+        "bash",
+        "-c",
+        "python scripts/bootstrap.py && python -u -m pipeline.mongodb_consumer",
+      ]
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    restart: unless-stopped
+
+  gerador:
+    image: radar-combustivel-app:latest
+    container_name: radar-gerador
+    depends_on:
+      mongo:
+        condition: service_healthy
+      pipeline:
+        condition: service_started
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?directConnection=true
+      DB_NAME: radar_combustivel
+      INTERVALO_SEGUNDOS: "2"
+      EVENTOS_POR_CICLO: "3"
+    command: ["python", "-u", "scripts/gerar_eventos.py"]
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    restart: unless-stopped
+
+  streamlit:
+    image: radar-combustivel-app:latest
+    container_name: radar-streamlit
+    depends_on:
+      redis:
+        condition: service_healthy
+      pipeline:
+        condition: service_started
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "8501:8501"
+    command:
+      [
+        "streamlit",
+        "run",
+        "app/streamlit_app.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501",
+        "--server.headless=true",
+      ]
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    restart: unless-stopped
 
 volumes:
   mongo_radar_data:
+  redis_radar_data:
